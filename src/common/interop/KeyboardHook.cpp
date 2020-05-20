@@ -5,14 +5,14 @@
 using namespace interop;
 using namespace System::Runtime::InteropServices;
 
-KeyboardHook::KeyboardHook()
+KeyboardHook::KeyboardHook(
+    KeyboardEventCallback ^ cb,
+    IsActiveCallback ^ activeCb)
 {
-    // initialize thread
-    // initialize window
     kbEventDispatch = gcnew Thread(gcnew ThreadStart(this, &KeyboardHook::DispatchProc));
-    queue = gcnew Queue<ShortcutCallback ^>();
-    shortcuts = gcnew Dictionary<SHORTCUT_HANDLE, ShortcutCallback ^>();
-    pressedKeys = gcnew Shortcut();
+    queue = gcnew Queue<KeyboardEvent ^>();
+    callback = cb;
+    isActive = activeCb;
 }
 
 KeyboardHook::~KeyboardHook()
@@ -35,84 +35,18 @@ void KeyboardHook::DispatchProc()
             Monitor::Wait(queue);
             continue;
         }
-        auto nextCallback = queue->Dequeue();
+        auto nextEv = queue->Dequeue();
 
         // Release lock while callback is being invoked
         Monitor::Exit(queue);
         
-        nextCallback->Invoke();
+        callback->Invoke(nextEv);
         
         // Re-aquire lock
         Monitor::Enter(queue);
     }
 
     Monitor::Exit(queue);
-}
-
-SHORTCUT_HANDLE KeyboardHook::GetHookHandle(Shortcut ^ shortcut)
-{
-    SHORTCUT_HANDLE handle = shortcut->Key;
-    handle |= shortcut->Win << 8;
-    handle |= shortcut->Ctrl << 9;
-    handle |= shortcut->Shift << 10;
-    handle |= shortcut->Alt << 11;
-    return handle;
-}
-
-SHORTCUT_HANDLE KeyboardHook::RegisterShortcut(
-    Shortcut ^ shortcut,
-    ShortcutCallback ^ callback)
-{
-    SHORTCUT_HANDLE handle = GetHookHandle(shortcut);
-    shortcuts->Add(handle, callback);
-    return handle;
-}
-
-bool KeyboardHook::UnregisterShortcut(SHORTCUT_HANDLE handle)
-{
-    return shortcuts->Remove(handle);
-}
-
-void KeyboardHook::UpdatePressedKey(DWORD code, bool replaceWith, unsigned char replaceWithKey)
-{
-    switch (code)
-    {
-    case VK_LWIN:
-    case VK_RWIN:
-        pressedKeys->Win = replaceWith;
-        break;
-    case VK_CONTROL:
-        pressedKeys->Ctrl = replaceWith;
-        break;
-    case VK_SHIFT:
-        pressedKeys->Shift = replaceWith;
-        break;
-    case VK_MENU:
-        pressedKeys->Alt = replaceWith;
-        break;
-    default:
-        pressedKeys->Key = replaceWithKey;
-        break;
-    }
-}
-
-void KeyboardHook::UpdatePressedKeys(KeyboardEvent ^ ev)
-{
-    switch (ev->wParam)
-    {
-    case WM_KEYDOWN:
-    case WM_SYSKEYDOWN:
-    {
-        UpdatePressedKey(ev->lParam->vkCode, true, ev->lParam->vkCode);
-    }
-    break;
-    case WM_KEYUP:
-    case WM_SYSKEYUP:
-    {
-        UpdatePressedKey(ev->lParam->vkCode, false, 0);
-    }
-    break;
-    }
 }
 
 void KeyboardHook::Start()
@@ -124,25 +58,23 @@ void KeyboardHook::Start()
     {
         throw std::exception("SetWindowsHookEx failed.");
     }
+
+    kbEventDispatch->Start();
 }
 
 LRESULT CALLBACK KeyboardHook::HookProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION)
+    if (nCode == HC_ACTION && isActive->Invoke())
     {
         KeyboardEvent ^ ev = gcnew KeyboardEvent();
-        ev->wParam = wParam;
-        ev->lParam = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        ev->message = wParam;
+        ev->key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam)->vkCode;
 
-        UpdatePressedKeys(ev);
-        SHORTCUT_HANDLE pressedKeysHookHandle = GetHookHandle(pressedKeys);
-        if (shortcuts->ContainsKey(pressedKeysHookHandle))
-        {
-            Monitor::Enter(queue);
-            queue->Enqueue(shortcuts[pressedKeysHookHandle]);
-            Monitor::Exit(queue);
-            return 1;
-        }
+        Monitor::Enter(queue);
+        queue->Enqueue(ev);
+        Monitor::Pulse(queue);
+        Monitor::Exit(queue);
+        return 1;
     }
     return CallNextHookEx(hookHandle, nCode, wParam, lParam);
 }
